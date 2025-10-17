@@ -131,8 +131,9 @@ def process_gutenberg_dataset(input_dir, output_dir, max_size_mb=500, separator=
     is_first_in_file = True
 
     for example in tqdm(dataset, desc="Processing books"):
-        book_id = example['id']
-        text = example['text']
+        # Handle different field name formats
+        book_id = example.get('id') or example.get('SOURCE', 'unknown')
+        text = example.get('text') or example.get('TEXT', '')
 
         # Check if primarily English (with sampling for performance)
         if not is_english(text):
