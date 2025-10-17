@@ -4,10 +4,18 @@ Optimized GPT Model Training Script
 This script recreates the training loop from ch05.ipynb but uses the optimized
 GPT model from models.gpt instead of the from_scratch implementation.
 
-The optimized model uses:
+Model optimizations:
 - MultiHeadAttention with scaled dot product and Flash Attention
 - PyTorch's native GELU activation
 - PyTorch's native LayerNorm
+
+Training optimizations:
+- Gradient clipping to prevent exploding gradients
+- Learning rate scheduling with linear warmup and cosine decay
+- Multi-worker data loading for faster data preprocessing
+- Early stopping based on validation loss
+- Progress bars and concise logging with tqdm
+- Automatic device selection (CUDA > MPS > CPU)
 """
 
 import argparse
@@ -17,6 +25,8 @@ import torch
 import torch.nn as nn
 import tiktoken
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from tqdm import tqdm
 from models.gpt import GPT
 from models.from_scratch import GPTDatasetV1
 
@@ -128,12 +138,13 @@ def create_dataloaders(text_data, train_ratio, batch_size, max_length, stride, t
     val_dataset = GPTDatasetV1(val_data, tokenizer, max_length, stride)
 
     # Create dataloaders
+    num_workers = min(4, os.cpu_count() or 0)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         drop_last=True,
-        num_workers=0
+        num_workers=num_workers
     )
 
     val_loader = DataLoader(
@@ -141,7 +152,7 @@ def create_dataloaders(text_data, train_ratio, batch_size, max_length, stride, t
         batch_size=batch_size,
         shuffle=False,
         drop_last=False,
-        num_workers=0
+        num_workers=num_workers
     )
 
     return train_loader, val_loader
@@ -212,37 +223,76 @@ def generate_and_print_sample(model, tokenizer, device, start_context, max_new_t
 
 
 def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs,
-                       eval_freq, eval_iter, start_context, tokenizer):
+                       eval_freq, eval_iter, start_context, tokenizer, scheduler=None,
+                       max_grad_norm=1.0, patience=5):
+    """Train model with gradient clipping, learning rate scheduling, and early stopping.
+    
+    Args:
+        patience: Number of eval steps without improvement before early stopping
+        max_grad_norm: Maximum gradient norm for clipping
+        scheduler: Optional learning rate scheduler
+    """
     # Initialize lists to track losses and tokens seen
-    train_losses, val_losses, track_tokens_seen = [], [], []
+    train_losses, val_losses, track_tokens_seen, lrs = [], [], [], []
     tokens_seen, global_step = 0, -1
+    best_val_loss = float('inf')
+    steps_without_improvement = 0
 
     # Main training loop
     for epoch in range(num_epochs):
-        model.train()  # Set model to training mode
+        model.train()
 
-        for input_batch, target_batch in train_loader:
-            optimizer.zero_grad()  # Reset loss gradients from previous batch iteration
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)
+        
+        for input_batch, target_batch in pbar:
+            optimizer.zero_grad()
             loss = calc_loss_batch(input_batch, target_batch, model, device)
-            loss.backward()  # Calculate loss gradients
-            optimizer.step()  # Update model weights using loss gradients
+            loss.backward()
+
+            # gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            
+            optimizer.step()
+            
+            # update lr scheduler
+            if scheduler is not None:
+                scheduler.step()
+            
             tokens_seen += input_batch.numel()
             global_step += 1
 
-            # Optional evaluation step
+            current_lr = optimizer.param_groups[0]['lr']
+            pbar.set_postfix({'loss': f'{loss.item():.3f}', 'lr': f'{current_lr:.2e}'})
+
             if global_step % eval_freq == 0:
                 train_loss, val_loss = evaluate_model(
                     model, train_loader, val_loader, device, eval_iter)
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
                 track_tokens_seen.append(tokens_seen)
-                print(f"Ep {epoch+1} (Step {global_step:06d}): "
-                      f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
+                lrs.append(current_lr)
+                
+                # Concise logging
+                tqdm.write(f"Step {global_step:05d} | Train: {train_loss:.3f} | "
+                          f"Val: {val_loss:.3f} | LR: {current_lr:.2e}")
+                
+                # Early stopping check
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    steps_without_improvement = 0
+                    tqdm.write(f"  ✓ New best val loss: {best_val_loss:.3f}")
+                else:
+                    steps_without_improvement += 1
+                    if steps_without_improvement >= patience:
+                        tqdm.write(f"  ✗ Early stopping after {patience} steps without improvement")
+                        return train_losses, val_losses, track_tokens_seen, lrs
 
         # Print a sample text after each epoch
+        tqdm.write(f"\nEpoch {epoch+1} sample:")
         generate_and_print_sample(model, tokenizer, device, start_context)
+        tqdm.write("")
 
-    return train_losses, val_losses, track_tokens_seen
+    return train_losses, val_losses, track_tokens_seen, lrs
 
 
 # ============================================================================
@@ -285,6 +335,24 @@ def main():
         default=0.0004,
         help="Learning rate (default: 0.0004)"
     )
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=100,
+        help="Number of warmup steps for learning rate scheduler (default: 100)"
+    )
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Maximum gradient norm for clipping (default: 1.0)"
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=5,
+        help="Early stopping patience in eval steps (default: 5)"
+    )
 
     args = parser.parse_args()
 
@@ -321,25 +389,62 @@ def main():
 
     # Initialize model
     model = GPT(GPT_CONFIG_124M)
-    # model = torch.compile(model)
-    device = torch.device("mps" if torch.mps.is_available() else "cpu")
-    print(f"Using device: {device}")
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    
+    print(f"Device: {device}")
     model.to(device)
+    
+    # Optional: Compile model for PyTorch 2.0+ (requires triton for CUDA, may not work on MPS)
+    # Uncomment if using PyTorch 2.0+ and compatible hardware
+    # model = torch.compile(model)
 
     # Initialize optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.1)
+    
+    # setup lr scheduler with warmup and cosine decay
+    total_steps = args.num_epochs * len(train_loader)
+    warmup_steps = min(args.warmup_steps, total_steps // 10)  # cap warmup at 10%
+    
+    if warmup_steps > 0 and total_steps > warmup_steps:
+        warmup_scheduler = LinearLR(
+            optimizer, 
+            start_factor=0.1, 
+            total_iters=warmup_steps
+        )
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer, 
+            T_max=total_steps - warmup_steps,
+            eta_min=args.learning_rate * 0.1  # min LR is 10% of initial
+        )
+        scheduler = SequentialLR(
+            optimizer, 
+            schedulers=[warmup_scheduler, cosine_scheduler], 
+            milestones=[warmup_steps]
+        )
+        print(f"LR Schedule: {warmup_steps} warmup steps, {total_steps - warmup_steps} cosine decay steps")
+    else:
+        scheduler = None
+        print("LR Schedule: None (LR constant)")
 
-    # Calculate initial losses
-    print("\nCalculating initial losses...")
+    print("\n" + "="*60)
+    print("Initial Evaluation")
+    print("="*60)
     with torch.no_grad():
         train_loss = calc_loss_loader(train_loader, model, device)
         val_loss = calc_loss_loader(val_loader, model, device)
-    print(f"Initial training loss: {train_loss:.3f}")
-    print(f"Initial validation loss: {val_loss:.3f}")
+    print(f"Train loss: {train_loss:.3f} | Val loss: {val_loss:.3f}")
 
     # Train model
-    print("\nStarting training...")
-    train_losses, val_losses, tokens_seen = train_model_simple(
+    print("\n" + "="*60)
+    print("Training")
+    print("="*60)
+    train_losses, val_losses, tokens_seen, lrs = train_model_simple(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -349,13 +454,18 @@ def main():
         eval_freq=5,
         eval_iter=5,
         start_context="Every effort moves you",
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
+        scheduler=scheduler,
+        max_grad_norm=args.max_grad_norm,
+        patience=args.patience
     )
 
     # Generate sample text with different strategies
-    print("\nGenerating sample text with different strategies:")
+    print("\n" + "="*60)
+    print("Final Generation Samples")
+    print("="*60)
 
-    print("\n1. Greedy sampling (temperature=0.0):")
+    print("\nGreedy (temp=0.0):")
     token_ids = generate_text(
         model=model,
         idx=text_to_token_ids("Every effort moves you", tokenizer).to(device),
@@ -365,7 +475,7 @@ def main():
     )
     print(token_ids_to_text(token_ids, tokenizer))
 
-    print("\n2. Temperature sampling (temperature=1.4, top_k=25):")
+    print("\nSampling (temp=1.4, top_k=25):")
     token_ids = generate_text(
         model=model,
         idx=text_to_token_ids("Every effort moves you", tokenizer).to(device),
@@ -375,6 +485,10 @@ def main():
         top_k=25
     )
     print(token_ids_to_text(token_ids, tokenizer))
+    
+    print("\n" + "="*60)
+    print("Training Complete")
+    print("="*60)
 
 
 if __name__ == "__main__":
