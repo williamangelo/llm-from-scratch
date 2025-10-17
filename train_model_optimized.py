@@ -320,6 +320,13 @@ def main():
         help="Number of files to read from data_dir (optional, reads all files if not specified)"
     )
     parser.add_argument(
+        "--model",
+        type=str,
+        default="gpt2-small",
+        choices=["gpt2-small", "gpt2-medium", "gpt2-large", "gpt2-xlarge"],
+        help="GPT model size to train (default: gpt2-small)"
+    )
+    parser.add_argument(
         "--num_epochs",
         type=int,
         default=1,
@@ -361,15 +368,25 @@ def main():
     # Set random seed for reproducibility
     torch.manual_seed(123)
 
-    GPT_CONFIG_124M = {
+    # Base configuration
+    BASE_CONFIG = {
         "vocab_size": 50257,
-        "context_length": 256,
-        "emb_dim": 768,
-        "n_heads": 12,
-        "n_layers": 12,
+        "context_length": 1024,
         "drop_rate": 0.1,
         "qkv_bias": False
     }
+
+    # Model-specific configurations
+    MODEL_CONFIGS = {
+        "gpt2-small": {"emb_dim": 768, "n_layers": 12, "n_heads": 12},      # 124M params
+        "gpt2-medium": {"emb_dim": 1024, "n_layers": 24, "n_heads": 16},    # 355M params
+        "gpt2-large": {"emb_dim": 1280, "n_layers": 36, "n_heads": 20},     # 774M params
+        "gpt2-xlarge": {"emb_dim": 1600, "n_layers": 48, "n_heads": 25},    # 1558M params
+    }
+
+    # Create final configuration by combining base and model-specific settings
+    GPT_CONFIG = BASE_CONFIG.copy()
+    GPT_CONFIG.update(MODEL_CONFIGS[args.model])
 
     # Initialize tokenizer
     tokenizer = tiktoken.get_encoding("gpt2")
@@ -384,13 +401,14 @@ def main():
         text_data=text_data,
         train_ratio=0.85,
         batch_size=args.batch_size,
-        max_length=GPT_CONFIG_124M["context_length"],
-        stride=GPT_CONFIG_124M["context_length"],
+        max_length=GPT_CONFIG["context_length"],
+        stride=GPT_CONFIG["context_length"],
         tokenizer=tokenizer
     )
 
     # Initialize model
-    model = GPT(GPT_CONFIG_124M)
+    print(f"\nModel: {args.model} ({GPT_CONFIG['emb_dim']} emb_dim, {GPT_CONFIG['n_layers']} layers, {GPT_CONFIG['n_heads']} heads)")
+    model = GPT(GPT_CONFIG)
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -472,7 +490,7 @@ def main():
         model=model,
         idx=text_to_token_ids("Every effort moves you", tokenizer).to(device),
         max_new_tokens=25,
-        context_size=GPT_CONFIG_124M["context_length"],
+        context_size=GPT_CONFIG["context_length"],
         temperature=0.0
     )
     print(token_ids_to_text(token_ids, tokenizer))
@@ -482,7 +500,7 @@ def main():
         model=model,
         idx=text_to_token_ids("Every effort moves you", tokenizer).to(device),
         max_new_tokens=25,
-        context_size=GPT_CONFIG_124M["context_length"],
+        context_size=GPT_CONFIG["context_length"],
         temperature=1.4,
         top_k=25
     )
