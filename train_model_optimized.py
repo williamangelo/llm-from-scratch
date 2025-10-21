@@ -10,8 +10,6 @@ Model optimizations:
 - PyTorch's native LayerNorm
 
 Training optimizations:
-- Gradient clipping to prevent exploding gradients
-- Learning rate scheduling with linear warmup and cosine decay
 - Multi-worker data loading for faster data preprocessing
 - Early stopping based on validation loss
 - Progress bars and concise logging with tqdm
@@ -25,7 +23,6 @@ import torch
 import torch.nn as nn
 import tiktoken
 from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 from models.gpt import GPT
 
@@ -282,14 +279,11 @@ def generate_and_print_sample(model, tokenizer, device, start_context, max_new_t
 
 
 def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs,
-                       eval_freq, eval_iter, start_context, tokenizer, scheduler=None,
-                       max_grad_norm=1.0, patience=5):
-    """Train model with gradient clipping, learning rate scheduling, and early stopping.
+                       eval_freq, eval_iter, start_context, tokenizer, patience=5):
+    """Train model with early stopping.
     
     Args:
         patience: Number of eval steps without improvement before early stopping
-        max_grad_norm: Maximum gradient norm for clipping
-        scheduler: Optional learning rate scheduler
     """
     # Initialize lists to track losses and tokens seen
     train_losses, val_losses, track_tokens_seen, lrs = [], [], [], []
@@ -309,10 +303,6 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
             loss.backward()
             
             optimizer.step()
-            
-            # update lr scheduler
-            if scheduler is not None:
-                scheduler.step()
             
             tokens_seen += input_batch.numel()
             global_step += 1
@@ -430,12 +420,6 @@ def main():
         help="Learning rate (default: 0.0004)"
     )
     parser.add_argument(
-        "--warmup_steps",
-        type=int,
-        default=100,
-        help="Number of warmup steps for learning rate scheduler (default: 100)"
-    )
-    parser.add_argument(
         "--patience",
         type=int,
         default=100,
@@ -543,31 +527,6 @@ def main():
 
     # Initialize optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.1)
-    
-    # setup lr scheduler with warmup and cosine decay
-    total_steps = args.num_epochs * len(train_loader)
-    warmup_steps = min(args.warmup_steps, total_steps // 10)  # cap warmup at 10%
-    
-    if warmup_steps > 0 and total_steps > warmup_steps:
-        warmup_scheduler = LinearLR(
-            optimizer, 
-            start_factor=0.1, 
-            total_iters=warmup_steps
-        )
-        cosine_scheduler = CosineAnnealingLR(
-            optimizer, 
-            T_max=total_steps - warmup_steps,
-            eta_min=args.learning_rate * 0.1  # min LR is 10% of initial
-        )
-        scheduler = SequentialLR(
-            optimizer, 
-            schedulers=[warmup_scheduler, cosine_scheduler], 
-            milestones=[warmup_steps]
-        )
-        print(f"LR Schedule: {warmup_steps} warmup steps, {total_steps - warmup_steps} cosine decay steps")
-    else:
-        scheduler = None
-        print("LR Schedule: None (LR constant)")
 
     print("\n" + "="*60)
     print("Initial Evaluation")
@@ -594,8 +553,6 @@ def main():
         eval_iter=args.eval_iter,
         start_context="Every effort moves you",
         tokenizer=tokenizer,
-        scheduler=scheduler,
-        max_grad_norm=args.max_grad_norm,
         patience=args.patience
     )
 
