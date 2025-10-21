@@ -450,6 +450,24 @@ def main():
         default=5,
         help="Early stopping patience in eval steps (default: 5)"
     )
+    parser.add_argument(
+        "--eval_freq",
+        type=int,
+        default=5,
+        help="Evaluate model every N training steps (default: 5)"
+    )
+    parser.add_argument(
+        "--eval_iter",
+        type=int,
+        default=5,
+        help="Number of batches to use for evaluation during training (default: 5)"
+    )
+    parser.add_argument(
+        "--initial_eval_batches",
+        type=int,
+        default=20,
+        help="Number of batches to use for initial evaluation (default: 20)"
+    )
 
     args = parser.parse_args()
 
@@ -549,10 +567,12 @@ def main():
     print("\n" + "="*60)
     print("Initial Evaluation")
     print("="*60)
+    # Use limited batches for initial eval to avoid slowness on large datasets
+    initial_eval_batches = min(args.initial_eval_batches, len(train_loader), len(val_loader))
     with torch.no_grad():
-        train_loss = calc_loss_loader(train_loader, model, device)
-        val_loss = calc_loss_loader(val_loader, model, device)
-    print(f"Train loss: {train_loss:.3f} | Val loss: {val_loss:.3f}")
+        train_loss = calc_loss_loader(train_loader, model, device, num_batches=initial_eval_batches)
+        val_loss = calc_loss_loader(val_loader, model, device, num_batches=initial_eval_batches)
+    print(f"Train loss: {train_loss:.3f} | Val loss: {val_loss:.3f} (evaluated on {initial_eval_batches} batches)")
 
     # Train model
     print("\n" + "="*60)
@@ -565,8 +585,8 @@ def main():
         optimizer=optimizer,
         device=device,
         num_epochs=args.num_epochs,
-        eval_freq=5,
-        eval_iter=5,
+        eval_freq=args.eval_freq,
+        eval_iter=args.eval_iter,
         start_context="Every effort moves you",
         tokenizer=tokenizer,
         scheduler=scheduler,
