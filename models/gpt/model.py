@@ -41,7 +41,7 @@ class MultiHeadAttention(nn.Module):
         context_vec = nn.functional.scaled_dot_product_attention(
             queries, keys, values, attn_mask=None, dropout_p=use_dropout, is_causal=True)
 
-        # Combine heads, where self.d_out = self.num_heads * self.head_dim
+        # combine heads
         context_vec = context_vec.transpose(1, 2).contiguous().view(batch_size, num_tokens, self.d_out)
 
         context_vec = self.proj(context_vec)
@@ -80,13 +80,13 @@ class TransformerBlock(nn.Module):
         self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
     
     def forward(self, x):
-        shortcut = x
+        shortcut = x # residual connection
         x = self.norm1(x)
         x = self.att(x)
         x = self.drop_shortcut(x)
         x = x + shortcut
 
-        shortcut = x
+        shortcut = x # residual connection
         x = self.norm2(x)
         x = self.ff(x)
         x = self.drop_shortcut(x)

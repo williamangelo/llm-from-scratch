@@ -235,7 +235,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_size_mb",
         type=int,
-        default=1,
+        default=50,
         help="Maximum file size for each combined output file in megabytes"
     )
     parser.add_argument(
@@ -247,8 +247,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--buffer_size",
         type=int,
-        default=8192*1024,
-        help="Buffer size for file writing in bytes (default: 8MB)"
+        default=8192*1024*4,
+        help="Buffer size for file writing in bytes (default: 32MB)"
     )
 
     args = parser.parse_args()
