@@ -24,11 +24,61 @@ import os
 import torch
 import torch.nn as nn
 import tiktoken
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 from models.gpt import GPT
-from models.from_scratch import GPTDatasetV1
+
+
+# ============================================================================
+# Optimized Dataset Implementation
+# ============================================================================
+
+class GPTDatasetV2(Dataset):
+    """Optimized GPT Dataset with lazy tokenization and on-the-fly slicing.
+    
+    Performance improvements over GPTDatasetV1:
+    - Tokenizes once and stores as a single contiguous tensor (not individual chunks)
+    - Slices on-the-fly in __getitem__ (avoids creating thousands of tensors upfront)
+    - ~10-100x faster initialization for large datasets
+    - Lower memory overhead
+    """
+    
+    def __init__(self, txt, tokenizer, max_length, stride):
+        """Initialize dataset by tokenizing text once.
+        
+        Args:
+            txt: Raw text string to tokenize
+            tokenizer: Tokenizer (e.g., tiktoken)
+            max_length: Context window size
+            stride: Stride for sliding window (controls overlap)
+        """
+        # Tokenize once and store as tensor
+        self.token_ids = torch.tensor(
+            tokenizer.encode(txt, allowed_special={"<|endoftext|>"}),
+            dtype=torch.long
+        )
+        self.max_length = max_length
+        self.stride = stride
+        
+        # Calculate number of samples using stride
+        # Each sample needs max_length + 1 tokens (input + target)
+        self.num_samples = max(0, (len(self.token_ids) - max_length - 1) // stride + 1)
+    
+    def __len__(self):
+        return self.num_samples
+    
+    def __getitem__(self, idx):
+        """Get a sample by slicing the token tensor on-the-fly."""
+        start_idx = idx * self.stride
+        end_idx = start_idx + self.max_length
+        
+        # Input: tokens[start:end]
+        # Target: tokens[start+1:end+1] (shifted by 1)
+        input_chunk = self.token_ids[start_idx:end_idx]
+        target_chunk = self.token_ids[start_idx + 1:end_idx + 1]
+        
+        return input_chunk, target_chunk
 
 
 # ============================================================================
@@ -127,15 +177,22 @@ def load_text_data_from_dir(data_path, num_files=None):
 
 
 def create_dataloaders(text_data, train_ratio, batch_size, max_length, stride, tokenizer):
-    """Create training and validation dataloaders using from_scratch implementation."""
+    """Create training and validation dataloaders using optimized GPTDatasetV2."""
     # Split data
     split_idx = int(train_ratio * len(text_data))
     train_data = text_data[:split_idx]
     val_data = text_data[split_idx:]
 
-    # Create datasets using GPTDatasetV1 from from_scratch
-    train_dataset = GPTDatasetV1(train_data, tokenizer, max_length, stride)
-    val_dataset = GPTDatasetV1(val_data, tokenizer, max_length, stride)
+    print(f"Creating datasets...")
+    print(f"  Train data: {len(train_data):,} characters")
+    print(f"  Val data: {len(val_data):,} characters")
+    
+    # Create datasets using optimized GPTDatasetV2
+    train_dataset = GPTDatasetV2(train_data, tokenizer, max_length, stride)
+    val_dataset = GPTDatasetV2(val_data, tokenizer, max_length, stride)
+    
+    print(f"  Train samples: {len(train_dataset):,}")
+    print(f"  Val samples: {len(val_dataset):,}")
 
     # Create dataloaders
     num_workers = min(4, os.cpu_count() or 0)
@@ -521,27 +578,6 @@ def main():
     print("\n" + "="*60)
     print("Final Generation Samples")
     print("="*60)
-
-    print("\nGreedy (temp=0.0):")
-    token_ids = generate_text(
-        model=model,
-        idx=text_to_token_ids("Every effort moves you", tokenizer).to(device),
-        max_new_tokens=25,
-        context_size=GPT_CONFIG["context_length"],
-        temperature=0.0
-    )
-    print(token_ids_to_text(token_ids, tokenizer))
-
-    print("\nSampling (temp=1.4, top_k=25):")
-    token_ids = generate_text(
-        model=model,
-        idx=text_to_token_ids("Every effort moves you", tokenizer).to(device),
-        max_new_tokens=25,
-        context_size=GPT_CONFIG["context_length"],
-        temperature=1.4,
-        top_k=25
-    )
-    print(token_ids_to_text(token_ids, tokenizer))
     
     # Save the trained model
     save_model(model, GPT_CONFIG, args.model)
