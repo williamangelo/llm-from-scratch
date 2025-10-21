@@ -307,9 +307,6 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
             optimizer.zero_grad()
             loss = calc_loss_batch(input_batch, target_batch, model, device)
             loss.backward()
-
-            # gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             
             optimizer.step()
             
@@ -417,13 +414,13 @@ def main():
     parser.add_argument(
         "--num_epochs",
         type=int,
-        default=1,
+        default=10,
         help="Number of training epochs (default: 10)"
     )
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=4,
+        default=8,
         help="Batch size for training (default: 8)"
     )
     parser.add_argument(
@@ -439,34 +436,33 @@ def main():
         help="Number of warmup steps for learning rate scheduler (default: 100)"
     )
     parser.add_argument(
-        "--max_grad_norm",
-        type=float,
-        default=1.0,
-        help="Maximum gradient norm for clipping (default: 1.0)"
-    )
-    parser.add_argument(
         "--patience",
         type=int,
-        default=5,
+        default=100,
         help="Early stopping patience in eval steps (default: 5)"
     )
     parser.add_argument(
         "--eval_freq",
         type=int,
-        default=5,
-        help="Evaluate model every N training steps (default: 5)"
+        default=100,
+        help="Evaluate model every N training steps (default: 100)"
     )
     parser.add_argument(
         "--eval_iter",
         type=int,
-        default=5,
-        help="Number of batches to use for evaluation during training (default: 5)"
+        default=10,
+        help="Number of batches to use for evaluation during training (default: 10)"
     )
     parser.add_argument(
         "--initial_eval_batches",
         type=int,
-        default=20,
-        help="Number of batches to use for initial evaluation (default: 20)"
+        default=50,
+        help="Number of batches to use for initial evaluation (default: 50)"
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Compile model with torch.compile for better performance (requires PyTorch 2.0+)"
     )
 
     args = parser.parse_args()
@@ -517,10 +513,17 @@ def main():
     
     # Calculate and display model info
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Format parameters in M/B notation
+    def format_params(params):
+        if params >= 1e9:
+            return f"{params/1e9:.1f}B"
+        else:
+            return f"{params/1e6:.0f}M"
+    
     print(f"\nModel: {args.model}")
-    print(f"  Architecture: {GPT_CONFIG['emb_dim']} emb_dim, {GPT_CONFIG['n_layers']} layers, {GPT_CONFIG['n_heads']} heads")
-    print(f"  Parameters: {total_params:,} total ({trainable_params:,} trainable)")
+    print(f"Architecture: {GPT_CONFIG['emb_dim']} emb_dim, {GPT_CONFIG['n_layers']} layers, {GPT_CONFIG['n_heads']} heads")
+    print(f"Parameters: {format_params(total_params)}")
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -532,9 +535,11 @@ def main():
     print(f"Device: {device}")
     model.to(device)
     
-    # Optional: Compile model for PyTorch 2.0+ (requires triton for CUDA, may not work on MPS)
-    # Uncomment if using PyTorch 2.0+ and compatible hardware
-    # model = torch.compile(model)
+    # Compile model if requested (PyTorch 2.0+ optimization)
+    if args.compile:
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
+        print("Model compiled successfully")
 
     # Initialize optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.1)
