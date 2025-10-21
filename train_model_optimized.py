@@ -298,6 +298,37 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
 
 
 # ============================================================================
+# Model Saving Functions
+# ============================================================================
+
+def save_model(model, config, model_name, save_dir="data/models"):
+    """Save trained model to disk.
+    
+    Args:
+        model: Trained GPT model
+        config: Model configuration dictionary
+        model_name: Name identifier for the model (e.g., 'gpt2-small')
+        save_dir: Directory to save model files (default: 'data/models')
+    """
+    # Create save directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Create filename with model name
+    model_path = os.path.join(save_dir, f"{model_name}.pth")
+    
+    # Save model state dict and configuration
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'config': config,
+        'model_name': model_name
+    }
+    
+    torch.save(checkpoint, model_path)
+    print(f"\n✓ Model saved to: {model_path}")
+    print(f"  Config: {config}")
+
+
+# ============================================================================
 # Main Training Script
 # ============================================================================
 
@@ -407,8 +438,14 @@ def main():
     )
 
     # Initialize model
-    print(f"\nModel: {args.model} ({GPT_CONFIG['emb_dim']} emb_dim, {GPT_CONFIG['n_layers']} layers, {GPT_CONFIG['n_heads']} heads)")
     model = GPT(GPT_CONFIG)
+    
+    # Calculate and display model info
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\nModel: {args.model}")
+    print(f"  Architecture: {GPT_CONFIG['emb_dim']} emb_dim, {GPT_CONFIG['n_layers']} layers, {GPT_CONFIG['n_heads']} heads")
+    print(f"  Parameters: {total_params:,} total ({trainable_params:,} trainable)")
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -505,6 +542,9 @@ def main():
         top_k=25
     )
     print(token_ids_to_text(token_ids, tokenizer))
+    
+    # Save the trained model
+    save_model(model, GPT_CONFIG, args.model)
     
     print("\n" + "="*60)
     print("Training Complete")
