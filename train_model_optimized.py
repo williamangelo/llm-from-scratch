@@ -28,6 +28,18 @@ from models.gpt import GPT
 
 
 # ============================================================================
+# Constants
+# ============================================================================
+
+# File I/O constants
+# For 50MB files, 4MB chunks provide good balance between memory efficiency and I/O performance
+FILE_READ_CHUNK_SIZE = 4 * 1024 * 1024  # 4MB - optimal for ~50MB files
+LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100MB - threshold for "large file" logging
+PROGRESS_THRESHOLD = 50 * 1024 * 1024  # 50MB - threshold for showing progress bars
+TOKENIZATION_PROGRESS_THRESHOLD = 10 * 1024 * 1024  # 10MB - threshold for tokenization progress
+
+
+# ============================================================================
 # Optimized Dataset Implementation
 # ============================================================================
 
@@ -41,7 +53,7 @@ class GPTDatasetV2(Dataset):
     - Lower memory overhead
     """
     
-    def __init__(self, txt, tokenizer, max_length, stride):
+    def __init__(self, txt, tokenizer, max_length, stride, show_progress=True):
         """Initialize dataset by tokenizing text once.
         
         Args:
@@ -49,12 +61,21 @@ class GPTDatasetV2(Dataset):
             tokenizer: Tokenizer (e.g., tiktoken)
             max_length: Context window size
             stride: Stride for sliding window (controls overlap)
+            show_progress: Whether to show progress bar during tokenization
         """
-        # Tokenize once and store as tensor
-        self.token_ids = torch.tensor(
-            tokenizer.encode(txt, allowed_special={"<|endoftext|>"}),
-            dtype=torch.long
-        )
+        # Tokenize with progress indication for large texts
+        text_size_bytes = len(txt.encode('utf-8'))
+        text_size_mb = text_size_bytes / (1024 * 1024)
+        if show_progress and text_size_bytes > TOKENIZATION_PROGRESS_THRESHOLD:
+            print(f"Tokenizing text ({text_size_mb:.1f} MB)...", end=" ", flush=True)
+        
+        token_ids_list = tokenizer.encode(txt, allowed_special={"<|endoftext|>"})
+        
+        if show_progress and text_size_bytes > TOKENIZATION_PROGRESS_THRESHOLD:
+            print(f"done ({len(token_ids_list):,} tokens)")
+        
+        # Convert to tensor
+        self.token_ids = torch.tensor(token_ids_list, dtype=torch.long)
         self.max_length = max_length
         self.stride = stride
         
@@ -133,22 +154,37 @@ def generate_text(model, idx, max_new_tokens, context_size, temperature=0.0, top
 # ============================================================================
 
 
-def load_text_data_from_dir(data_path, num_files=None):
-    """Load text data from a directory or single file.
+def load_text_data_from_dir(data_path, num_files=None, chunk_size=None):
+    """Load text data from a directory or single file with memory-efficient chunked reading.
 
     Args:
         data_path: Path to directory containing .txt files or path to a single .txt file
         num_files: Optional number of files to read (reads all if None, ignored for single files)
+        chunk_size: Size of chunks to read at a time in bytes (default: FILE_READ_CHUNK_SIZE)
 
     Returns:
         Combined text data from all files
     """
+    if chunk_size is None:
+        chunk_size = FILE_READ_CHUNK_SIZE
+    
     # Check if path is a file or directory
     if os.path.isfile(data_path):
-        # Single file case
-        print(f"Loading single file: {data_path}")
+        # Single file case - read in chunks to avoid loading entire large file into memory
+        file_size = os.path.getsize(data_path)
+        if file_size > LARGE_FILE_THRESHOLD:
+            print(f"Loading large file ({file_size / (1024*1024):.1f} MB): {data_path}")
+        else:
+            print(f"Loading file: {data_path}")
+        
+        chunks = []
         with open(data_path, "r", encoding="utf-8") as f:
-            return f.read()
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        return "".join(chunks)
 
     # Directory case - get all .txt files in the directory
     txt_files = sorted(glob.glob(os.path.join(data_path, "*.txt")))
@@ -162,12 +198,28 @@ def load_text_data_from_dir(data_path, num_files=None):
 
     print(f"Loading {len(txt_files)} file(s) from {data_path}")
 
-    # Read and combine all files
+    # Read and combine all files with chunked reading for large files
     combined_text = []
-    for file_path in txt_files:
-        print(f"  Reading: {os.path.basename(file_path)}")
+    total_size = sum(os.path.getsize(f) for f in txt_files)
+    show_progress = total_size > PROGRESS_THRESHOLD
+    
+    if show_progress:
+        pbar = tqdm(txt_files, desc="Reading files", unit="file", leave=False)
+    else:
+        pbar = txt_files
+    
+    for file_path in pbar:
+        if show_progress:
+            pbar.set_postfix(file=os.path.basename(file_path)[:30])
+        
+        chunks = []
         with open(file_path, "r", encoding="utf-8") as f:
-            combined_text.append(f.read())
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        combined_text.append("".join(chunks))
 
     # Join with newlines to separate different files
     return "\n\n".join(combined_text)
@@ -180,16 +232,11 @@ def create_dataloaders(text_data, train_ratio, batch_size, max_length, stride, t
     train_data = text_data[:split_idx]
     val_data = text_data[split_idx:]
 
-    print(f"Creating datasets...")
-    print(f"  Train data: {len(train_data):,} characters")
-    print(f"  Val data: {len(val_data):,} characters")
-    
     # Create datasets using optimized GPTDatasetV2
-    train_dataset = GPTDatasetV2(train_data, tokenizer, max_length, stride)
-    val_dataset = GPTDatasetV2(val_data, tokenizer, max_length, stride)
+    train_dataset = GPTDatasetV2(train_data, tokenizer, max_length, stride, show_progress=True)
+    val_dataset = GPTDatasetV2(val_data, tokenizer, max_length, stride, show_progress=True)
     
-    print(f"  Train samples: {len(train_dataset):,}")
-    print(f"  Val samples: {len(val_dataset):,}")
+    print(f"Datasets created: {len(train_dataset):,} train samples, {len(val_dataset):,} val samples")
 
     # Create dataloaders
     num_workers = min(4, os.cpu_count() or 0)
@@ -399,8 +446,8 @@ def main():
     parser.add_argument(
         "--num_epochs",
         type=int,
-        default=10,
-        help="Number of training epochs (default: 10)"
+        default=1,
+        help="Number of training epochs (default: 1)"
     )
     parser.add_argument(
         "--batch_size",
@@ -417,7 +464,7 @@ def main():
     parser.add_argument(
         "--patience",
         type=int,
-        default=100,
+        default=5,
         help="Early stopping patience in eval steps (default: 5)"
     )
     parser.add_argument(
