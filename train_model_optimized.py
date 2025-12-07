@@ -225,25 +225,20 @@ def calc_loss_batch(input_batch, target_batch, model, device):
 
 
 def calc_loss_loader(data_loader, model, device, num_batches=None):
-    """Calculate average loss over a dataloader.
-    
-    Optimized to minimize CPU-GPU synchronization by accumulating losses
-    as tensors and only converting to Python scalar at the end.
-    """
+    """Calculate average loss over a dataloader."""
     if len(data_loader) == 0:
         return float("nan")
     
     num_batches = min(num_batches or len(data_loader), len(data_loader))
-    
-    total_loss = torch.zeros(1, device=device)
+    total_loss = 0.0  # Accumulate on CPU as Python float
     
     for i, (input_batch, target_batch) in enumerate(data_loader):
         if i >= num_batches:
             break
         loss = calc_loss_batch(input_batch, target_batch, model, device)
-        total_loss += loss
+        total_loss += loss.item()  # Convert to Python float immediately
 
-    return (total_loss / num_batches).item()
+    return total_loss / num_batches
 
 
 # ============================================================================
