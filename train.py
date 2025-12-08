@@ -50,11 +50,14 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 # File I/O constants
-# For 50MB files, 4MB chunks provide good balance between memory efficiency and I/O performance
-FILE_READ_CHUNK_SIZE = 4 * 1024 * 1024  # 4MB - optimal for ~50MB files
-LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100MB - threshold for "large file" logging
-PROGRESS_THRESHOLD = 50 * 1024 * 1024  # 50MB - threshold for showing progress bars
-TOKENIZATION_PROGRESS_THRESHOLD = 10 * 1024 * 1024  # 10MB - threshold for tokenization progress
+FILE_READ_CHUNK_SIZE = 4 * 1024 * 1024  # 4MB
+LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100MB
+PROGRESS_THRESHOLD = 50 * 1024 * 1024  # 50MB
+TOKENIZATION_PROGRESS_THRESHOLD = 10 * 1024 * 1024  # 10MB
+
+# Memory safety thresholds
+MEMORY_MULTIPLIER = 3.0  # Peak memory is ~3x raw text size during tokenization
+MEMORY_SAFETY_MARGIN = 0.8  # Use at most 80% of available memory
 
 
 # ============================================================================
@@ -226,6 +229,130 @@ class StreamingGPTDataset(IterableDataset):
 # ============================================================================
 # Data Loading Functions
 # ============================================================================
+
+
+def get_available_memory():
+    """Get available system memory in bytes."""
+    try:
+        import psutil
+        return psutil.virtual_memory().available
+    except ImportError:
+        pass
+    
+    # Fallback for Linux: read from /proc/meminfo
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024
+    except (FileNotFoundError, PermissionError):
+        pass
+    
+    # Fallback for macOS: use vm_stat
+    import platform
+    if platform.system() == 'Darwin':
+        try:
+            import subprocess
+            # Get page size
+            page_size = int(subprocess.check_output(['sysctl', '-n', 'hw.pagesize']).strip())
+            # Get vm_stat output
+            vm_stat = subprocess.check_output(['vm_stat']).decode('utf-8')
+            
+            stats = {}
+            for line in vm_stat.split('\n'):
+                if ':' in line:
+                    key, value = line.split(':')
+                    # Remove trailing period and whitespace
+                    value = value.strip().rstrip('.')
+                    try:
+                        stats[key.strip()] = int(value)
+                    except ValueError:
+                        pass
+            
+            # Available = free + inactive (pages that can be reclaimed)
+            free_pages = stats.get('Pages free', 0)
+            inactive_pages = stats.get('Pages inactive', 0)
+            available = (free_pages + inactive_pages) * page_size
+            return available
+        except (subprocess.SubprocessError, ValueError, KeyError):
+            pass
+    
+    return None
+
+
+def estimate_memory_required(data_size_bytes):
+    """Estimate peak memory required for loading and tokenizing data.
+    
+    Returns:
+        Estimated peak memory in bytes
+    """
+    # Peak memory during tokenization:
+    # - Raw text: data_size_bytes
+    # - Token IDs list (Python list): ~2x text size (list overhead + int objects)
+    # - Final tensor: ~0.5x text size (int64, but fewer tokens than chars)
+    # During tokenization, all three exist simultaneously
+    return int(data_size_bytes * MEMORY_MULTIPLIER)
+
+
+def check_memory_for_dataset(data_path, num_files=None, streaming=False):
+    """Check if dataset will fit in memory and warn if not.
+    
+    Args:
+        data_path: Path to data directory or file
+        num_files: Optional limit on number of files
+        streaming: Whether streaming mode is enabled
+    
+    Returns:
+        Tuple of (data_size_bytes, should_use_streaming, warning_message)
+    """
+    if os.path.isfile(data_path):
+        data_size = os.path.getsize(data_path)
+        file_count = 1
+    else:
+        txt_files = sorted(glob.glob(os.path.join(data_path, "*.txt")))
+        if num_files is not None:
+            txt_files = txt_files[:num_files]
+        data_size = sum(os.path.getsize(f) for f in txt_files)
+        file_count = len(txt_files)
+    
+    available_memory = get_available_memory()
+    estimated_peak = estimate_memory_required(data_size)
+    
+    data_size_gb = data_size / (1024**3)
+    estimated_peak_gb = estimated_peak / (1024**3)
+    
+    warning_msg = None
+    should_use_streaming = False
+    
+    if available_memory is not None:
+        available_gb = available_memory / (1024**3)
+        safe_limit = available_memory * MEMORY_SAFETY_MARGIN
+        
+        if not streaming and estimated_peak > safe_limit:
+            should_use_streaming = True
+            warning_msg = (
+                f"WARNING: Dataset ({data_size_gb:.1f} GB, {file_count} files) may exceed available memory!\n"
+                f"  Estimated peak memory: {estimated_peak_gb:.1f} GB\n"
+                f"  Available memory: {available_gb:.1f} GB\n"
+                f"  Recommendation: Use --streaming flag to reduce memory usage"
+            )
+        elif not streaming and estimated_peak > safe_limit * 0.5:
+            warning_msg = (
+                f"NOTE: Dataset ({data_size_gb:.1f} GB) will use significant memory (~{estimated_peak_gb:.1f} GB peak).\n"
+                f"  Consider using --streaming if you experience memory issues."
+            )
+    else:
+        # Can't determine available memory, use heuristic based on dataset size
+        if not streaming and data_size > 2 * 1024**3:  # > 2GB
+            should_use_streaming = True
+            warning_msg = (
+                f"WARNING: Large dataset detected ({data_size_gb:.1f} GB, {file_count} files).\n"
+                f"  Estimated peak memory: {estimated_peak_gb:.1f} GB\n"
+                f"  Could not determine available system memory.\n"
+                f"  Recommendation: Use --streaming flag to reduce memory usage"
+            )
+    
+    return data_size, should_use_streaming, warning_msg
 
 
 def get_txt_files(data_path, num_files=None):
@@ -698,6 +825,18 @@ def main():
 
     # Initialize tokenizer
     tokenizer = tiktoken.get_encoding("gpt2")
+
+    # Check memory requirements before loading data
+    data_size, should_use_streaming, memory_warning = check_memory_for_dataset(
+        args.data_dir, args.num_files, args.streaming
+    )
+    
+    if memory_warning:
+        logger.warning(memory_warning)
+    
+    if should_use_streaming and not args.streaming:
+        logger.warning("Automatically enabling --streaming mode due to memory constraints")
+        args.streaming = True
 
     # Create dataloaders (streaming or standard mode)
     if args.streaming:
