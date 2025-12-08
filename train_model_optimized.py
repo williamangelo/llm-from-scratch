@@ -18,6 +18,7 @@ Training optimizations:
 
 import argparse
 import glob
+import logging
 import os
 import torch
 import torch.nn as nn
@@ -25,6 +26,24 @@ import tiktoken
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from models.gpt import GPT
+
+
+# ============================================================================
+# Logging Setup
+# ============================================================================
+
+class TqdmLoggingHandler(logging.Handler):
+    """Logging handler that uses tqdm.write() to avoid interfering with progress bar."""
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+        except Exception:
+            self.handleError(record)
+
+
+# Module-level logger (logging.getLogger() returns a singleton, thread-safe)
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -67,12 +86,12 @@ class GPTDatasetV2(Dataset):
         text_size_bytes = len(txt.encode('utf-8'))
         text_size_mb = text_size_bytes / (1024 * 1024)
         if show_progress and text_size_bytes > TOKENIZATION_PROGRESS_THRESHOLD:
-            print(f"Tokenizing text ({text_size_mb:.1f} MB)...", end=" ", flush=True)
+            logger.info(f"Tokenizing text ({text_size_mb:.1f} MB)...")
         
         token_ids_list = tokenizer.encode(txt, allowed_special={"<|endoftext|>"})
         
         if show_progress and text_size_bytes > TOKENIZATION_PROGRESS_THRESHOLD:
-            print(f"done ({len(token_ids_list):,} tokens)")
+            logger.info(f"Tokenization complete: {len(token_ids_list):,} tokens")
         
         # Convert to tensor
         self.token_ids = torch.tensor(token_ids_list, dtype=torch.long)
@@ -173,9 +192,9 @@ def load_text_data_from_dir(data_path, num_files=None, chunk_size=None):
         # Single file case - read in chunks to avoid loading entire large file into memory
         file_size = os.path.getsize(data_path)
         if file_size > LARGE_FILE_THRESHOLD:
-            print(f"Loading large file ({file_size / (1024*1024):.1f} MB): {data_path}")
+            logger.info(f"Loading large file ({file_size / (1024*1024):.1f} MB): {os.path.basename(data_path)}")
         else:
-            print(f"Loading file: {data_path}")
+            logger.info(f"Loading file: {os.path.basename(data_path)}")
         
         chunks = []
         with open(data_path, "r", encoding="utf-8") as f:
@@ -196,7 +215,7 @@ def load_text_data_from_dir(data_path, num_files=None, chunk_size=None):
     if num_files is not None:
         txt_files = txt_files[:num_files]
 
-    print(f"Loading {len(txt_files)} file(s) from {data_path}")
+    logger.info(f"Loading {len(txt_files)} file(s) from {data_path}")
 
     # Read and combine all files with chunked reading for large files
     combined_text = []
@@ -236,7 +255,7 @@ def create_dataloaders(text_data, train_ratio, batch_size, max_length, stride, t
     train_dataset = GPTDatasetV2(train_data, tokenizer, max_length, stride, show_progress=True)
     val_dataset = GPTDatasetV2(val_data, tokenizer, max_length, stride, show_progress=True)
     
-    print(f"Datasets created: {len(train_dataset):,} train samples, {len(val_dataset):,} val samples")
+    logger.info(f"Datasets: {len(train_dataset):,} train, {len(val_dataset):,} val samples")
 
     # Create dataloaders
     num_workers = min(4, os.cpu_count() or 0)
@@ -316,7 +335,7 @@ def generate_and_print_sample(model, tokenizer, device, start_context, max_new_t
             context_size=context_size
         )
     decoded_text = token_ids_to_text(token_ids, tokenizer)
-    print(decoded_text.replace("\n", " "))  # Compact print format
+    logger.info(decoded_text.replace("\n", " "))
     model.train()
 
 
@@ -360,25 +379,23 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
                 track_tokens_seen.append(tokens_seen)
                 lrs.append(current_lr)
                 
-                # Concise logging
-                tqdm.write(f"Step {global_step:05d} | Train: {train_loss:.3f} | "
+                logger.info(f"Step {global_step:05d} | Train: {train_loss:.3f} | "
                           f"Val: {val_loss:.3f} | LR: {current_lr:.2e}")
                 
                 # Early stopping check
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     steps_without_improvement = 0
-                    tqdm.write(f"  ✓ New best val loss: {best_val_loss:.3f}")
+                    logger.info(f"New best val loss: {best_val_loss:.3f}")
                 else:
                     steps_without_improvement += 1
                     if steps_without_improvement >= patience:
-                        tqdm.write(f"  ✗ Early stopping after {patience} steps without improvement")
+                        logger.info(f"Early stopping after {patience} steps without improvement")
                         return train_losses, val_losses, track_tokens_seen, lrs
 
-        # Print a sample text after each epoch
-        tqdm.write(f"\nEpoch {epoch+1} sample:")
+        # Generate sample text after each epoch
+        logger.info(f"Epoch {epoch+1} sample:")
         generate_and_print_sample(model, tokenizer, device, start_context)
-        tqdm.write("")
 
     return train_losses, val_losses, track_tokens_seen, lrs
 
@@ -410,8 +427,7 @@ def save_model(model, config, model_name, save_dir="data/models"):
     }
     
     torch.save(checkpoint, model_path)
-    print(f"\n✓ Model saved to: {model_path}")
-    print(f"  Config: {config}")
+    logger.info(f"Model saved: {model_path}")
 
 
 # ============================================================================
@@ -493,6 +509,14 @@ def main():
 
     args = parser.parse_args()
 
+    # Configure logging to use tqdm.write() to avoid interfering with progress bar
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.handlers = []
+    handler = TqdmLoggingHandler()
+    handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+    logger.addHandler(handler)
+
     # Set random seed for reproducibility
     torch.manual_seed(123)
 
@@ -522,7 +546,7 @@ def main():
     # Load text data
     text_data = load_text_data_from_dir(args.data_dir, args.num_files)
 
-    print(f"Total characters: {len(text_data):,}")
+    logger.info(f"Loaded {len(text_data):,} characters")
 
     # Create dataloaders
     train_loader, val_loader = create_dataloaders(
@@ -547,9 +571,8 @@ def main():
         else:
             return f"{params/1e6:.0f}M"
     
-    print(f"\nModel: {args.model}")
-    print(f"Architecture: {GPT_CONFIG['emb_dim']} emb_dim, {GPT_CONFIG['n_layers']} layers, {GPT_CONFIG['n_heads']} heads")
-    print(f"Parameters: {format_params(total_params)}")
+    logger.info(f"Model: {args.model} ({format_params(total_params)} params, "
+                f"{GPT_CONFIG['emb_dim']}d, {GPT_CONFIG['n_layers']}L, {GPT_CONFIG['n_heads']}H)")
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -558,32 +581,26 @@ def main():
     else:
         device = torch.device("cpu")
     
-    print(f"Device: {device}")
+    logger.info(f"Device: {device}")
     model.to(device)
     
     # Compile model if requested (PyTorch 2.0+ optimization)
     if args.compile:
-        print("Compiling model with torch.compile...")
+        logger.info("Compiling model with torch.compile")
         model = torch.compile(model)
-        print("Model compiled successfully")
 
     # Initialize optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.1)
 
-    print("\n" + "="*60)
-    print("Initial Evaluation")
-    print("="*60)
-    # Use limited batches for initial eval to avoid slowness on large datasets
+    # Initial evaluation
     initial_eval_batches = min(args.initial_eval_batches, len(train_loader), len(val_loader))
     with torch.no_grad():
         train_loss = calc_loss_loader(train_loader, model, device, num_batches=initial_eval_batches)
         val_loss = calc_loss_loader(val_loader, model, device, num_batches=initial_eval_batches)
-    print(f"Train loss: {train_loss:.3f} | Val loss: {val_loss:.3f} (evaluated on {initial_eval_batches} batches)")
+    logger.info(f"Initial loss - Train: {train_loss:.3f}, Val: {val_loss:.3f}")
 
     # Train model
-    print("\n" + "="*60)
-    print("Training")
-    print("="*60)
+    logger.info("Starting training")
     train_losses, val_losses, tokens_seen, lrs = train_model_simple(
         model=model,
         train_loader=train_loader,
@@ -598,17 +615,10 @@ def main():
         patience=args.patience
     )
 
-    # Generate sample text with different strategies
-    print("\n" + "="*60)
-    print("Final Generation Samples")
-    print("="*60)
-    
     # Save the trained model
     save_model(model, GPT_CONFIG, args.model)
     
-    print("\n" + "="*60)
-    print("Training Complete")
-    print("="*60)
+    logger.info("Training complete")
 
 
 if __name__ == "__main__":
