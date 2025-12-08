@@ -20,16 +20,14 @@ import argparse
 import glob
 import logging
 import os
+
 import torch
 import tiktoken
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 from tqdm import tqdm
+
 from models.gpt import GPT
 
-
-# ============================================================================
-# Logging Setup
-# ============================================================================
 
 class TqdmLoggingHandler(logging.Handler):
     """Logging handler that uses tqdm.write() to avoid interfering with progress bar."""
@@ -41,15 +39,8 @@ class TqdmLoggingHandler(logging.Handler):
             self.handleError(record)
 
 
-# Module-level logger (logging.getLogger() returns a singleton, thread-safe)
-logger = logging.getLogger(__name__)
 
-
-# ============================================================================
-# Constants
-# ============================================================================
-
-# File I/O constants
+# File I/O
 FILE_READ_CHUNK_SIZE = 4 * 1024 * 1024  # 4MB
 LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100MB
 PROGRESS_THRESHOLD = 50 * 1024 * 1024  # 50MB
@@ -60,9 +51,8 @@ MEMORY_MULTIPLIER = 3.0  # Peak memory is ~3x raw text size during tokenization
 MEMORY_SAFETY_MARGIN = 0.8  # Use at most 80% of available memory
 
 
-# ============================================================================
-# Optimized Dataset Implementation
-# ============================================================================
+logger = logging.getLogger(__name__)
+torch.set_float32_matmul_precision('high')
 
 class GPTDatasetV2(Dataset):
     """Optimized GPT Dataset with lazy tokenization and on-the-fly slicing.
@@ -224,11 +214,6 @@ class StreamingGPTDataset(IterableDataset):
         avg_samples = total_samples / len(sample_files)
         self._estimated_samples = int(avg_samples * len(self.file_paths))
         return self._estimated_samples
-
-
-# ============================================================================
-# Data Loading Functions
-# ============================================================================
 
 
 def get_available_memory():
@@ -618,7 +603,7 @@ def train_model(model, train_loader, val_loader, optimizer, device, num_epochs,
         for batch_idx, (input_batch, target_batch) in enumerate(pbar):
             # Mixed precision forward pass
             if scaler is not None:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     loss = calc_loss_batch(input_batch, target_batch, model, device)
                 loss = loss / gradient_accumulation_steps
                 scaler.scale(loss).backward()
@@ -895,7 +880,7 @@ def main():
     scaler = None
     if args.mixed_precision:
         if device.type == "cuda":
-            scaler = torch.cuda.amp.GradScaler()
+            scaler = torch.amp.GradScaler('cuda')
             logger.info("Mixed precision (fp16) enabled")
         else:
             logger.info("Mixed precision requested but not available on this device (requires CUDA)")
