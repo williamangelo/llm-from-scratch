@@ -21,9 +21,8 @@ import glob
 import logging
 import os
 import torch
-import torch.nn as nn
 import tiktoken
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 from tqdm import tqdm
 from models.gpt import GPT
 
@@ -70,6 +69,9 @@ class GPTDatasetV2(Dataset):
     - Slices on-the-fly in __getitem__ (avoids creating thousands of tensors upfront)
     - ~10-100x faster initialization for large datasets
     - Lower memory overhead
+    
+    Memory optimization:
+    - Use from_tokens() to avoid duplicating text data during train/val split
     """
     
     def __init__(self, txt, tokenizer, max_length, stride, show_progress=True):
@@ -102,6 +104,22 @@ class GPTDatasetV2(Dataset):
         # Each sample needs max_length + 1 tokens (input + target)
         self.num_samples = max(0, (len(self.token_ids) - max_length - 1) // stride + 1)
     
+    @classmethod
+    def from_tokens(cls, token_ids, max_length, stride):
+        """Create dataset from pre-tokenized tensor (memory efficient).
+        
+        Args:
+            token_ids: Pre-tokenized tensor of token IDs
+            max_length: Context window size
+            stride: Stride for sliding window
+        """
+        instance = cls.__new__(cls)
+        instance.token_ids = token_ids
+        instance.max_length = max_length
+        instance.stride = stride
+        instance.num_samples = max(0, (len(token_ids) - max_length - 1) // stride + 1)
+        return instance
+    
     def __len__(self):
         return self.num_samples
     
@@ -118,59 +136,119 @@ class GPTDatasetV2(Dataset):
         return input_chunk, target_chunk
 
 
-# ============================================================================
-# Text Generation Functions
-# ============================================================================
-
-def text_to_token_ids(text, tokenizer):
-    encoded = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
-    encoded_tensor = torch.tensor(encoded).unsqueeze(0)  # add batch dimension
-    return encoded_tensor
-
-
-def token_ids_to_text(token_ids, tokenizer):
-    flat = token_ids.squeeze(0)
-    return tokenizer.decode(flat.tolist())
-
-
-def generate_text(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
-
-    for _ in range(max_new_tokens):
-        idx_cond = idx[:, -context_size:]
-        with torch.no_grad():
-            logits = model(idx_cond)
-        logits = logits[:, -1, :]
-
-        # Filter logits with top_k sampling
-        if top_k is not None:
-            top_logits, _ = torch.topk(logits, top_k)
-            min_val = top_logits[:, -1]
-            logits = torch.where(logits < min_val, torch.tensor(float("-inf")).to(logits.device), logits)
-
-        # Apply temperature scaling
-        if temperature > 0.0:
-            logits = logits / temperature
-            # Numerical stability: subtract rowwise max before softmax
-            logits = logits - logits.max(dim=-1, keepdim=True).values
-            probs = torch.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+class StreamingGPTDataset(IterableDataset):
+    """Memory-efficient streaming dataset that loads and tokenizes files lazily.
+    
+    Designed for large datasets (10GB+) that don't fit in memory.
+    Files are processed one at a time, tokenized, and samples yielded on-the-fly.
+    
+    Memory usage: Only one file's tokens are held in memory at a time.
+    For a 16GB dataset split into 300 files (~53MB each), peak memory is ~100-150MB
+    for token data instead of 16GB+.
+    """
+    
+    def __init__(self, file_paths, tokenizer, max_length, stride, 
+                 train_ratio=0.85, is_validation=False):
+        """
+        Args:
+            file_paths: List of paths to .txt files
+            tokenizer: Tokenizer (e.g., tiktoken)
+            max_length: Context window size
+            stride: Stride for sliding window
+            train_ratio: Fraction of each file to use for training (rest for validation)
+            is_validation: If True, use last (1-train_ratio) of each file
+        """
+        self.file_paths = file_paths
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.stride = stride
+        self.train_ratio = train_ratio
+        self.is_validation = is_validation
+        self._estimated_samples = None
+    
+    def _tokenize_file(self, file_path):
+        """Load and tokenize a single file, returning tensor of token IDs."""
+        with open(file_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        token_ids = self.tokenizer.encode(text, allowed_special={"<|endoftext|>"})
+        del text
+        return torch.tensor(token_ids, dtype=torch.long)
+    
+    def _generate_samples_from_tokens(self, token_ids):
+        """Generate (input, target) samples from a token tensor."""
+        split_idx = int(self.train_ratio * len(token_ids))
+        if self.is_validation:
+            token_ids = token_ids[split_idx:]
         else:
-            # Greedy sampling
-            idx_next = torch.argmax(logits, dim=-1, keepdim=True)
-
-        # Stop if end-of-sequence token is encountered
-        if idx_next == eos_id:
-            break
-
-        # Append sampled index to the running sequence
-        idx = torch.cat((idx, idx_next), dim=1)
-
-    return idx
+            token_ids = token_ids[:split_idx]
+        
+        num_samples = max(0, (len(token_ids) - self.max_length - 1) // self.stride + 1)
+        
+        for i in range(num_samples):
+            start_idx = i * self.stride
+            end_idx = start_idx + self.max_length
+            yield token_ids[start_idx:end_idx], token_ids[start_idx + 1:end_idx + 1]
+    
+    def __iter__(self):
+        """Iterate through all files, yielding samples lazily."""
+        for file_path in self.file_paths:
+            token_ids = self._tokenize_file(file_path)
+            yield from self._generate_samples_from_tokens(token_ids)
+            del token_ids
+    
+    def estimate_total_samples(self):
+        """Estimate total samples by sampling a few files (for progress bars)."""
+        if self._estimated_samples is not None:
+            return self._estimated_samples
+        
+        if len(self.file_paths) == 0:
+            return 0
+        
+        sample_files = self.file_paths[:min(3, len(self.file_paths))]
+        total_samples = 0
+        
+        for file_path in sample_files:
+            file_size = os.path.getsize(file_path)
+            # Rough estimate: ~4 bytes per character, ~4 chars per token on average
+            estimated_tokens = file_size // 4
+            if self.is_validation:
+                effective_len = int((1 - self.train_ratio) * estimated_tokens)
+            else:
+                effective_len = int(self.train_ratio * estimated_tokens)
+            samples = max(0, (effective_len - self.max_length - 1) // self.stride + 1)
+            total_samples += samples
+        
+        avg_samples = total_samples / len(sample_files)
+        self._estimated_samples = int(avg_samples * len(self.file_paths))
+        return self._estimated_samples
 
 
 # ============================================================================
 # Data Loading Functions
 # ============================================================================
+
+
+def get_txt_files(data_path, num_files=None):
+    """Get list of .txt files from a directory or single file path.
+    
+    Args:
+        data_path: Path to directory containing .txt files or path to a single .txt file
+        num_files: Optional number of files to return (returns all if None)
+    
+    Returns:
+        List of file paths
+    """
+    if os.path.isfile(data_path):
+        return [data_path]
+    
+    txt_files = sorted(glob.glob(os.path.join(data_path, "*.txt")))
+    if not txt_files:
+        raise ValueError(f"No .txt files found in {data_path}")
+    
+    if num_files is not None:
+        txt_files = txt_files[:num_files]
+    
+    return txt_files
 
 
 def load_text_data_from_dir(data_path, num_files=None, chunk_size=None):
@@ -245,15 +323,31 @@ def load_text_data_from_dir(data_path, num_files=None, chunk_size=None):
 
 
 def create_dataloaders(text_data, train_ratio, batch_size, max_length, stride, tokenizer):
-    """Create training and validation dataloaders using optimized GPTDatasetV2."""
-    # Split data
-    split_idx = int(train_ratio * len(text_data))
-    train_data = text_data[:split_idx]
-    val_data = text_data[split_idx:]
-
-    # Create datasets using optimized GPTDatasetV2
-    train_dataset = GPTDatasetV2(train_data, tokenizer, max_length, stride, show_progress=True)
-    val_dataset = GPTDatasetV2(val_data, tokenizer, max_length, stride, show_progress=True)
+    """Create training and validation dataloaders using optimized GPTDatasetV2.
+    
+    Memory optimization: Tokenize once, then split to avoid duplicating large text strings.
+    """
+    # Tokenize full dataset once (more memory efficient than tokenizing splits separately)
+    logger.info(f"Tokenizing full dataset ({len(text_data):,} characters)...")
+    token_ids_list = tokenizer.encode(text_data, allowed_special={"<|endoftext|>"})
+    logger.info(f"Tokenization complete: {len(token_ids_list):,} tokens")
+    
+    # Free the text data immediately after tokenization
+    del text_data
+    
+    # Convert to tensor
+    token_ids = torch.tensor(token_ids_list, dtype=torch.long)
+    del token_ids_list  # Free the list
+    
+    # Split tokenized data (avoids duplicating large text strings)
+    split_idx = int(train_ratio * len(token_ids))
+    train_tokens = token_ids[:split_idx]
+    val_tokens = token_ids[split_idx:]
+    del token_ids  # Free the full tensor
+    
+    # Create datasets from pre-tokenized data
+    train_dataset = GPTDatasetV2.from_tokens(train_tokens, max_length, stride)
+    val_dataset = GPTDatasetV2.from_tokens(val_tokens, max_length, stride)
     
     logger.info(f"Datasets: {len(train_dataset):,} train, {len(val_dataset):,} val samples")
 
@@ -278,6 +372,57 @@ def create_dataloaders(text_data, train_ratio, batch_size, max_length, stride, t
     return train_loader, val_loader
 
 
+def create_streaming_dataloaders(file_paths, batch_size, max_length, stride, tokenizer, train_ratio=0.85):
+    """Create streaming dataloaders for large datasets that don't fit in memory.
+    
+    Each file is loaded, tokenized, and processed one at a time.
+    Train/val split is done per-file (first train_ratio for train, rest for val).
+    
+    Memory usage: Only one file's worth of tokens in memory at a time.
+    """
+    logger.info(f"Creating streaming dataloaders for {len(file_paths)} files")
+    
+    train_dataset = StreamingGPTDataset(
+        file_paths=file_paths,
+        tokenizer=tokenizer,
+        max_length=max_length,
+        stride=stride,
+        train_ratio=train_ratio,
+        is_validation=False
+    )
+    
+    val_dataset = StreamingGPTDataset(
+        file_paths=file_paths,
+        tokenizer=tokenizer,
+        max_length=max_length,
+        stride=stride,
+        train_ratio=train_ratio,
+        is_validation=True
+    )
+    
+    train_samples = train_dataset.estimate_total_samples()
+    val_samples = val_dataset.estimate_total_samples()
+    logger.info(f"Estimated samples: ~{train_samples:,} train, ~{val_samples:,} val")
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=True,
+        num_workers=0
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=0
+    )
+    
+    return train_loader, val_loader
+
+
 # ============================================================================
 # Loss Calculation Functions
 # ============================================================================
@@ -290,21 +435,21 @@ def calc_loss_batch(input_batch, target_batch, model, device):
     return loss
 
 
-def calc_loss_loader(data_loader, model, device, num_batches=None):
+def calc_loss_loader(data_loader, model, device, num_batches):
     """Calculate average loss over a dataloader."""
-    if len(data_loader) == 0:
-        return float("nan")
-    
-    num_batches = min(num_batches or len(data_loader), len(data_loader))
-    total_loss = 0.0  # Accumulate on CPU as Python float
+    total_loss = 0.0
+    batches_processed = 0
     
     for i, (input_batch, target_batch) in enumerate(data_loader):
         if i >= num_batches:
             break
         loss = calc_loss_batch(input_batch, target_batch, model, device)
-        total_loss += loss.item()  # Convert to Python float immediately
+        total_loss += loss.item()
+        batches_processed += 1
 
-    return total_loss / num_batches
+    if batches_processed == 0:
+        return float("nan")
+    return total_loss / batches_processed
 
 
 # ============================================================================
@@ -321,30 +466,15 @@ def evaluate_model(model, train_loader, val_loader, device, eval_iter):
     return train_loss, val_loss
 
 
-def generate_and_print_sample(model, tokenizer, device, start_context, max_new_tokens=50):
-    """Generate and print a sample text from the model."""
-    model.eval()
-    # Access context_size from the positional embedding layer
-    context_size = model.pos_emb.weight.shape[0]
-    encoded = text_to_token_ids(start_context, tokenizer).to(device)
-    with torch.no_grad():
-        token_ids = generate_text(
-            model=model,
-            idx=encoded,
-            max_new_tokens=max_new_tokens,
-            context_size=context_size
-        )
-    decoded_text = token_ids_to_text(token_ids, tokenizer)
-    logger.info(decoded_text.replace("\n", " "))
-    model.train()
-
-
-def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs,
-                       eval_freq, eval_iter, start_context, tokenizer, patience=5):
-    """Train model with early stopping.
+def train_model(model, train_loader, val_loader, optimizer, device, num_epochs,
+                eval_freq, eval_iter, patience,
+                gradient_accumulation_steps, scaler):
+    """Train model with early stopping, gradient accumulation, and mixed precision.
     
     Args:
         patience: Number of eval steps without improvement before early stopping
+        gradient_accumulation_steps: Number of steps to accumulate gradients
+        scaler: GradScaler for mixed precision training (None to disable)
     """
     # Initialize lists to track losses and tokens seen
     train_losses, val_losses, track_tokens_seen, lrs = [], [], [], []
@@ -358,18 +488,32 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)
         
-        for input_batch, target_batch in pbar:
-            optimizer.zero_grad()
-            loss = calc_loss_batch(input_batch, target_batch, model, device)
-            loss.backward()
+        for batch_idx, (input_batch, target_batch) in enumerate(pbar):
+            # Mixed precision forward pass
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    loss = calc_loss_batch(input_batch, target_batch, model, device)
+                loss = loss / gradient_accumulation_steps
+                scaler.scale(loss).backward()
+            else:
+                loss = calc_loss_batch(input_batch, target_batch, model, device)
+                loss = loss / gradient_accumulation_steps
+                loss.backward()
             
-            optimizer.step()
+            # Only update weights after accumulating gradients
+            if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
             
             tokens_seen += input_batch.numel()
             global_step += 1
 
             current_lr = optimizer.param_groups[0]['lr']
-            pbar.set_postfix({'loss': f'{loss.item():.3f}', 'lr': f'{current_lr:.2e}'})
+            pbar.set_postfix({'loss': f'{(loss.item() * gradient_accumulation_steps):.3f}', 'lr': f'{current_lr:.2e}'})
 
             if global_step % eval_freq == 0:
                 train_loss, val_loss = evaluate_model(
@@ -392,10 +536,6 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
                     if steps_without_improvement >= patience:
                         logger.info(f"Early stopping after {patience} steps without improvement")
                         return train_losses, val_losses, track_tokens_seen, lrs
-
-        # Generate sample text after each epoch
-        logger.info(f"Epoch {epoch+1} sample:")
-        generate_and_print_sample(model, tokenizer, device, start_context)
 
     return train_losses, val_losses, track_tokens_seen, lrs
 
@@ -441,13 +581,13 @@ def main():
         description="Train GPT model on text data"
     )
     parser.add_argument(
-        "--data_dir",
+        "--data-dir",
         type=str,
         default="data/the_verdict.txt",
         help="Directory containing training text files (.txt) or path to a single .txt file (default: data/the_verdict.txt)"
     )
     parser.add_argument(
-        "--num_files",
+        "--num-files",
         type=int,
         default=None,
         help="Number of files to read from data_dir (optional, reads all files if not specified)"
@@ -460,19 +600,19 @@ def main():
         help="GPT model size to train (default: gpt2-small)"
     )
     parser.add_argument(
-        "--num_epochs",
+        "--epochs",
         type=int,
         default=1,
         help="Number of training epochs (default: 1)"
     )
     parser.add_argument(
-        "--batch_size",
+        "--batch-size",
         type=int,
         default=8,
         help="Batch size for training (default: 8)"
     )
     parser.add_argument(
-        "--learning_rate",
+        "--learning-rate",
         type=float,
         default=0.0004,
         help="Learning rate (default: 0.0004)"
@@ -484,19 +624,19 @@ def main():
         help="Early stopping patience in eval steps (default: 5)"
     )
     parser.add_argument(
-        "--eval_freq",
+        "--eval-freq",
         type=int,
         default=100,
         help="Evaluate model every N training steps (default: 100)"
     )
     parser.add_argument(
-        "--eval_iter",
+        "--eval-iter",
         type=int,
         default=10,
         help="Number of batches to use for evaluation during training (default: 10)"
     )
     parser.add_argument(
-        "--initial_eval_batches",
+        "--initial-eval-batches",
         type=int,
         default=50,
         help="Number of batches to use for initial evaluation (default: 50)"
@@ -505,6 +645,22 @@ def main():
         "--compile",
         action="store_true",
         help="Compile model with torch.compile for better performance (requires PyTorch 2.0+)"
+    )
+    parser.add_argument(
+        "--mixed-precision",
+        action="store_true",
+        help="Use mixed precision (fp16) training to reduce memory usage (requires CUDA)"
+    )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Number of gradient accumulation steps (allows larger effective batch size with less memory)"
+    )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Use streaming mode for large datasets (loads files lazily, reduces memory usage)"
     )
 
     args = parser.parse_args()
@@ -543,20 +699,32 @@ def main():
     # Initialize tokenizer
     tokenizer = tiktoken.get_encoding("gpt2")
 
-    # Load text data
-    text_data = load_text_data_from_dir(args.data_dir, args.num_files)
-
-    logger.info(f"Loaded {len(text_data):,} characters")
-
-    # Create dataloaders
-    train_loader, val_loader = create_dataloaders(
-        text_data=text_data,
-        train_ratio=0.85,
-        batch_size=args.batch_size,
-        max_length=GPT_CONFIG["context_length"],
-        stride=GPT_CONFIG["context_length"],
-        tokenizer=tokenizer
-    )
+    # Create dataloaders (streaming or standard mode)
+    if args.streaming:
+        file_paths = get_txt_files(args.data_dir, args.num_files)
+        total_size = sum(os.path.getsize(f) for f in file_paths)
+        logger.info(f"Streaming mode: {len(file_paths)} files, {total_size / (1024**3):.2f} GB total")
+        
+        train_loader, val_loader = create_streaming_dataloaders(
+            file_paths=file_paths,
+            batch_size=args.batch_size,
+            max_length=GPT_CONFIG["context_length"],
+            stride=GPT_CONFIG["context_length"],
+            tokenizer=tokenizer,
+            train_ratio=0.85
+        )
+    else:
+        text_data = load_text_data_from_dir(args.data_dir, args.num_files)
+        logger.info(f"Loaded {len(text_data):,} characters")
+        
+        train_loader, val_loader = create_dataloaders(
+            text_data=text_data,
+            train_ratio=0.85,
+            batch_size=args.batch_size,
+            max_length=GPT_CONFIG["context_length"],
+            stride=GPT_CONFIG["context_length"],
+            tokenizer=tokenizer
+        )
 
     # Initialize model
     model = GPT(GPT_CONFIG)
@@ -584,6 +752,15 @@ def main():
     logger.info(f"Device: {device}")
     model.to(device)
     
+    # Setup mixed precision training if requested
+    scaler = None
+    if args.mixed_precision:
+        if device.type == "cuda":
+            scaler = torch.cuda.amp.GradScaler()
+            logger.info("Mixed precision (fp16) enabled")
+        else:
+            logger.info("Mixed precision requested but not available on this device (requires CUDA)")
+    
     # Compile model if requested (PyTorch 2.0+ optimization)
     if args.compile:
         logger.info("Compiling model with torch.compile")
@@ -591,9 +768,17 @@ def main():
 
     # Initialize optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.1)
+    
+    # Log memory optimization settings
+    if args.gradient_accumulation_steps > 1:
+        logger.info(f"Gradient accumulation: {args.gradient_accumulation_steps} steps "
+                   f"(effective batch size: {args.batch_size * args.gradient_accumulation_steps})")
 
     # Initial evaluation
-    initial_eval_batches = min(args.initial_eval_batches, len(train_loader), len(val_loader))
+    if args.streaming:
+        initial_eval_batches = args.initial_eval_batches
+    else:
+        initial_eval_batches = min(args.initial_eval_batches, len(train_loader), len(val_loader))
     with torch.no_grad():
         train_loss = calc_loss_loader(train_loader, model, device, num_batches=initial_eval_batches)
         val_loss = calc_loss_loader(val_loader, model, device, num_batches=initial_eval_batches)
@@ -601,18 +786,18 @@ def main():
 
     # Train model
     logger.info("Starting training")
-    train_losses, val_losses, tokens_seen, lrs = train_model_simple(
+    train_losses, val_losses, tokens_seen, lrs = train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         optimizer=optimizer,
         device=device,
-        num_epochs=args.num_epochs,
+        num_epochs=args.epochs,
         eval_freq=args.eval_freq,
         eval_iter=args.eval_iter,
-        start_context="Every effort moves you",
-        tokenizer=tokenizer,
-        patience=args.patience
+        patience=args.patience,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        scaler=scaler
     )
 
     # Save the trained model
